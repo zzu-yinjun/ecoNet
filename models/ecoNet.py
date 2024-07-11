@@ -17,152 +17,54 @@ from transformers import Wav2Vec2Model
 import torch.nn.functional as F
 from models.models_eco import UNetWrapper, EmbeddingAdapter
 import os
+# from Zoe.zoedepth.models.builder import build_model
+# from Zoe.zoedepth.utils.config import get_config
+import torch
+from models.unrt_aspp import*
 
+from diffusers import AutoencoderKL
 
-class DoubleConv(nn.Sequential):
-    def __init__(self, in_channels, out_channels, mid_channels=None):
-        if mid_channels is None:
-            mid_channels = out_channels
-        super(DoubleConv, self).__init__(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+# from Zoe.zoedepth.utils.misc import pil_to_batched_tensor
 
+# class ModifiedZoeDepth(nn.Module):
+#     def __init__(self, original_model, latent_dim):
+#         super(ModifiedZoeDepth, self).__init__()
+#         self.backbone = original_model
+        
+#         # 添加额外的层来将深度特征转换为指导向量
+#         self.guidance_layers = nn.Sequential(
+#             nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),
+#             nn.ReLU(),
+#             nn.AdaptiveAvgPool2d((1, 1)),
+#             nn.Flatten(),
+#             nn.Linear(128, latent_dim)
+#         )
 
-class Down(nn.Sequential):
-    def __init__(self, in_channels, out_channels):
-        super(Down, self).__init__(
-            nn.MaxPool2d(2, stride=2),
-            DoubleConv(in_channels, out_channels)
-        )
+#     def forward(self, x):
+#         # 获取 ZoeDepth 的中间特征，而不是最终的深度图
+#         features = self.backbone.core.core_out(self.backbone.core.get_encoder_features(x))
+        
+#         # 将特征转换为指导向量
+#         guidance_vector = self.guidance_layers(features)
+#         return guidance_vector
 
-
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels, bilinear=True):
-        super(Up, self).__init__()
-        if bilinear:
-            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-            self.conv = DoubleConv(in_channels, out_channels, in_channels // 2)
-        else:
-            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-            self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        x1 = self.up(x1)
-        # [N, C, H, W]
-        diff_y = x2.size()[2] - x1.size()[2]
-        diff_x = x2.size()[3] - x1.size()[3]
-
-        # padding_left, padding_right, padding_top, padding_bottom
-        x1 = F.pad(x1, [diff_x // 2, diff_x - diff_x // 2,
-                        diff_y // 2, diff_y - diff_y // 2])
-
-        x = torch.cat([x2, x1], dim=1)
-        x = self.conv(x)
-        return x
-
-
-class OutConv(nn.Sequential):
-    def __init__(self, in_channels, num_classes):
-        super(OutConv, self).__init__(
-            nn.Conv2d(in_channels, num_classes, kernel_size=1)
-        )
-
-class ASPP(nn.Module):
-    def __init__(self, in_channel=512, depth=256):
-        super(ASPP,self).__init__()
-        # global average pooling : init nn.AdaptiveAvgPool2d ;also forward torch.mean(,,keep_dim=True)
-        self.mean = nn.AdaptiveAvgPool2d((1, 1))
-        self.conv = nn.Conv2d(in_channel, depth, 1, 1)
-        # k=1 s=1 no pad
-        self.atrous_block1 = nn.Conv2d(in_channel, depth, 1, 1)
-        self.atrous_block6 = nn.Conv2d(in_channel, depth, 3, 1, padding=6, dilation=6)
-        self.atrous_block12 = nn.Conv2d(in_channel, depth, 3, 1, padding=12, dilation=12)
-        self.atrous_block18 = nn.Conv2d(in_channel, depth, 3, 1, padding=18, dilation=18)
- 
-        self.conv_1x1_output = nn.Conv2d(depth * 5, depth, 1, 1)
- 
-    def forward(self, x):
-        size = x.shape[2:]
- 
-        image_features = self.mean(x)
-        image_features = self.conv(image_features)
-        image_features = F.upsample(image_features, size=size, mode='bilinear')
- 
-        atrous_block1 = self.atrous_block1(x)
- 
-        atrous_block6 = self.atrous_block6(x)
- 
-        atrous_block12 = self.atrous_block12(x)
- 
-        atrous_block18 = self.atrous_block18(x)
- 
-        net = self.conv_1x1_output(torch.cat([image_features, atrous_block1, atrous_block6,
-                                              atrous_block12, atrous_block18], dim=1))
-        return net
-
-
-
-class UNet_aspp(nn.Module):
-    def __init__(self,
-                 in_channels: int = 2,
-                 num_classes: int = 1,
-                 bilinear: bool = True,
-                 base_c: int = 32,
-                 gpu_ids=[]):
-        super(UNet_aspp, self).__init__()
-        self.in_channels = in_channels
-        self.num_classes = num_classes
-        self.bilinear = bilinear
-
-        self.in_conv = DoubleConv(in_channels, base_c)
-        self.down1 = Down(base_c, base_c * 2)
-        self.down2 = Down(base_c * 2, base_c * 4)
-        self.down3 = Down(base_c * 4, base_c * 8)
-        factor = 2 if bilinear else 1
-        self.down4 = Down(base_c * 8, base_c * 16 // factor)
-        self.up1 = Up(base_c * 16, base_c * 8 // factor, bilinear)
-        self.up2 = Up(base_c * 8, base_c * 4 // factor, bilinear)
-        self.up3 = Up(base_c * 4, base_c * 2 // factor, bilinear)
-        self.up4 = Up(base_c * 2, base_c, bilinear)
-        self.out_conv = OutConv(base_c, num_classes)
-        self.aspp1 = ASPP(32,32)
-        self.aspp2 = ASPP(64,64)
-        self.aspp3 = ASPP(128,128)
-        self.aspp4 = ASPP(256,256)
-        # self.aspp1 = ASPP(64,64)
-        # self.aspp2 = ASPP(128,128)
-        # self.aspp3 = ASPP(256,256)
-        # self.aspp4 = ASPP(512,512)
-
-        # self.aspp4 = ASPP()
-
-     
-    def forward(self, x):
-        # x = torch.transpose(x, 0, 1)
-        # x = torch.unsqueeze(x, 1)
-        # print(x.shape)
-        x1 = self.in_conv(x)
+# class TeacherWrapper:
+#     def __init__(self, model_type="zoedepth_nk", latent_dim=256):
   
-        x1 = self.aspp1(x1)
-        x2 = self.down1(x1)
-   
-        x2 = self.aspp2(x2)
-        x3 = self.down2(x2)
-    
-        x3 = self.aspp3(x3)
-        x4 = self.down3(x3)
 
-        x4 = self.aspp4(x4)
-        # x5 = self.down4(x4)
-        print(x4.shape)
-       
+#         model_zoe_n = torch.hub.load("./Zoe", "ZoeD_N", source="local", pretrained=True)
 
-        return x4
+        
+#         self.model = ModifiedZoeDepth(model_zoe_n, latent_dim)
+#         self.model.eval()
+
+#     @torch.no_grad()
+#     def process(self, rgb_image):
+#         # 直接获取指导向量
+#         guidance_vector = self.model(rgb_image)
+#         return guidance_vector
+
+
 
 
 
@@ -346,11 +248,25 @@ class EcoDepthEncoder(nn.Module):
         file_path = "./conf/config_diffusion.yml"
 
         config_fpn = load_config(file_path)
-        self.fpn = FPN(config_fpn)    
-        self.unet_aspp=UNet_aspp()
+        self.fpn = FPN(config_fpn)   
+
+        self.unet_aspp=UNet()
+
+        # self.encoder_vq = sd_model.first_stage_model
+
+        # self.teacher_wrapper = TeacherWrapper(latent_dim=256) 
+        # self.vae = AutoencoderKL.from_pretrained("/home/yinjun/project/test_ecoNet/sd-vae-ft-mse",local_files_only=True)
+        # self.pre_vae = nn.Conv2d(2, 3, kernel_size=3, stride=1, padding=1)
+        # for param in self.vae.parameters():
+        #   param.requires_grad = False
     
+        # del sd_model.cond_stage_model
+        # del self.encoder_vq.decoder
         del self.unet.unet.diffusion_model.out
 
+        # for param in self.encoder_vq.parameters():
+        #     param.requires_grad = False
+      
 
 
     # 初始化神经网络模型的权重
@@ -369,12 +285,20 @@ class EcoDepthEncoder(nn.Module):
         return self.out_conv(x)
 
     def forward(self, audio_spec,audio_wave):
-        # 在使用 torch.no_grad() 时防止对 VQ 编码器的梯度计算，因为它被冻结了
-
-        latents=self.fpn(audio_spec)
+ 
+    
+       
+  
+        # latents_spec=self.fpn(audio_spec)
         # latents=self.unet_aspp(audio_spec)
-
-        # 生成一个表示条件场景嵌入的张量
+      
+        # guidance_vector = self.teacher_wrapper.process(rgb)
+        # print("gui",guidance_vector.shape)
+        # audio_spec=self.pre_vae(audio_spec)
+        # latents = self.vae.encode(audio_spec).latent_dist.sample()
+        # latents = latents * self.vae.config.scaling_factor
+        latents=self.unet_aspp(audio_spec)
+        
         conditioning_scene_embedding = self.cide_module(audio_wave)  # 由vit得到
      
 
@@ -391,9 +315,9 @@ class EcoDepthEncoder(nn.Module):
             outs[1],
             torch.cat([outs[2], F.interpolate(outs[3], scale_factor=2)], dim=1),
         ]
-       
-        x = torch.cat([self.layer1(feats[0]), self.layer2(feats[1]), feats[2]], dim=1)
 
+        x = torch.cat([self.layer1(feats[0]), self.layer2(feats[1]), feats[2]], dim=1)
+        
         return self.out_layer(x)
 
 
@@ -467,7 +391,7 @@ class CIDE(nn.Module):
 class EcoDepth(nn.Module):
     def __init__(self):
         super().__init__()
-        # self.max_depth = 30
+        self.max_depth = 14.104
 
 
       
@@ -492,10 +416,11 @@ class EcoDepth(nn.Module):
     def forward(self, audio_spec,audio_wave):
 
         conv_feats = self.encoder(audio_spec,audio_wave)
+      
         out = self.decoder([conv_feats])
         out_depth = self.last_layer_depth(out)
 
-        # out_depth = torch.sigmoid(out_depth) * self.max_depth
+        out_depth = torch.sigmoid(out_depth) * self.max_depth
 
         return out_depth
 
@@ -533,10 +458,13 @@ class Decoder(nn.Module):
     def forward(self, conv_feats):
         # 3次连续反卷积
         out = self.deconv_layers(conv_feats[0])
+        
         # 卷积+bn+relu
         out = self.conv_layers(out)
+       
 
         # 两次上采样
+        out = self.up(out)
         out = self.up(out)
         # out = self.up(out)
 
@@ -589,15 +517,15 @@ class Decoder(nn.Module):
 
 
 
-if __name__ == "__main__":
+# if __name__ == "__main__":
 
-    device = torch.device("cpu")
+#     device = torch.device("cpu")
 
 
  
-    inputs_rgb = torch.randn((4, 2, 128, 128)).to(device)
+#     inputs_rgb = torch.randn((4, 2, 128, 128)).to(device)
   
-    model = EcoDepth()
+#     model = EcoDepth()
 
-    pred= model(inputs_rgb)
+#     pred= model(inputs_rgb)
     

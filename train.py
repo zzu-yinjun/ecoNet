@@ -20,7 +20,7 @@ from models.ecoNet import *
 from models.weight_init import *
 from models.diffuision_demo import *
 from models.functions import *
-
+from models.allCriterion import *
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
@@ -97,7 +97,7 @@ def main(cfg: DictConfig) -> None:
     if cfg.mode.criterion == "L1":
         # criterion= LogDepthLoss()
         criterion = nn.L1Loss().to(device)
-
+        # criterion=ImprovedDistillationLoss().to(device)
         # criterion = nn.HuberLoss().to(device)
 
     learning_rate = cfg.mode.learning_rate
@@ -187,7 +187,7 @@ def main(cfg: DictConfig) -> None:
 
             audio_spec = data["audio_spec"].to(device)
             audio_wave= data["audio_wave"].to(device)
-
+     
    
    
 
@@ -199,7 +199,7 @@ def main(cfg: DictConfig) -> None:
             # forward
             depth_pred = model(audio_spec,audio_wave)
            
-            loss = criterion(depth_pred[gtdepth != 0], gtdepth[gtdepth != 0])
+            loss = criterion(depth_pred[gtdepth != 0],gtdepth[gtdepth != 0])
 
             batch_loss.append(loss.item())
 
@@ -225,15 +225,14 @@ def main(cfg: DictConfig) -> None:
                     # audio_val=image_loader_to_tensor(audio)
                     gtdepth_val = data["depth"].to(device)
                     audio_wave_val = data["audio_wave"].to(device)
+                    rgb_val = data["img"].to(device)
 
-                    # min_value=audio.min()
-                    # max_value=audio.max()
-                    # audio_val=spectrogram_loader_to_tensor( audio_val,min_value,max_value)
+               
 
                     depth_pred_val = model(audio_spec_val,audio_wave_val)
          
                     loss_val = criterion(
-                        depth_pred_val[gtdepth_val != 0], gtdepth_val[gtdepth_val != 0]
+                    depth_pred_val[gtdepth_val != 0], gtdepth_val[gtdepth_val != 0]
                     )
 
                     batch_loss_val.append(loss_val.item())
